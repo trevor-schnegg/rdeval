@@ -15,8 +15,18 @@ BINDIR := $(BUILD)/.o
 LDFLAGS += -pthread
 LIBS = -lz -lcrypto -lhts
 
-# Static linking settings
 UNAME_S := $(shell uname -s)
+
+# Apple Silicon Homebrew installs non-system dependencies under /opt/homebrew,
+# which is not in the default compiler/linker search path. Resolve the active
+# Homebrew prefix only on macOS; retain the existing Linux build behavior.
+ifeq ($(UNAME_S),Darwin)
+	BREW_PREFIX := $(shell brew --prefix 2>/dev/null)
+	CFLAGS += -I$(BREW_PREFIX)/opt/openssl@3/include -I$(BREW_PREFIX)/opt/htslib/include
+	LDFLAGS += -L$(BREW_PREFIX)/opt/openssl@3/lib -L$(BREW_PREFIX)/opt/htslib/lib
+endif
+
+# Static linking settings
 ifeq ($(UNAME_S),Linux)
     STATIC_LDFLAGS = -static -pthread
 else
