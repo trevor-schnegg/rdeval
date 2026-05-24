@@ -4,6 +4,7 @@
 #include <fstream>
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 
 #include <htslib/hts.h>
 #include <htslib/sam.h>
@@ -509,21 +510,51 @@ void InReads::initFilters() {
 }
 
 void InReads::filterRecords() {
-	
-	uint64_t readCount = readLens.size();
+
+	/*
+	 * Filtering records loaded from .rd files is currently supported only for
+	 * statistics derived from the stored per-read length/quality summaries.
+	 *
+	 * The .rd format stores nucleotide composition only as global totals
+	 * (totA, totC, totG, totT, totN), not as per-read values. Therefore, if
+	 * filtering removes any stored record, the nucleotide-composition totals
+	 * can no longer be updated exactly and must be invalidated.
+	 *
+	 * FUTURE WORK:
+	 * To retain exact A/C/G/T/N statistics after filtering .rd inputs, the .rd
+	 * format would need to store per-read nucleotide-composition information.
+	 * This should be implemented using a compact packed representation, since
+	 * storing five full counters per read would substantially increase the
+	 * size of the compressed summary format.
+	 */
+
+	const uint64_t readCount = readLens.size();
+
 	LenVector<float> readLensFiltered;
+
 	for (uint64_t i = 0; i < readCount; ++i) {
-		if (!applyFilter(readLens[i].first, readLens[i].second))
-			readLensFiltered.push_back(std::make_pair(readLens[i].first, readLens[i].second));
+		if (!applyFilter(readLens[i].first, readLens[i].second)) {
+			readLensFiltered.push_back(
+				std::make_pair(readLens[i].first, readLens[i].second)
+			);
+		}
 	}
-	if (readLens.size() != readLensFiltered.size()) { // if the read counts after filtering is different these counts are invalidated
+
+	if (readCount != readLensFiltered.size()) {
+
+		/*
+		 * At least one record represented in an .rd summary was removed.
+		 * Since nucleotide counts are not stored per read, the filtered
+		 * aggregate base composition cannot be reconstructed exactly.
+		 */
 		totA = 0;
 		totC = 0;
 		totG = 0;
 		totT = 0;
 		totN = 0;
 	}
-	readLens = readLensFiltered; // overwrite the counts
+
+	readLens = std::move(readLensFiltered);
 	totReads = readLens.size();
 }
 
@@ -867,8 +898,17 @@ void InReads::report() {
 
 	if (totReads > 0) {
 		
-		if (userInput.filter != "none" && getFileExt(userInput.file('r', 0)) == "rd")
+		const bool hasRdInput = std::any_of(
+			userInput.inFiles.begin(),
+			userInput.inFiles.end(),
+			[](const std::string& file) {
+				return getFileExt(file) == "rd";
+			}
+		);
+
+		if (userInput.filter != "none" && hasRdInput) {
 			filterRecords();
+		}
 		
 		readLens.sort();
 		
@@ -1576,11 +1616,10 @@ static inline float read_f32_bits(const unsigned char*& p) {
 
 void InReads::readTableCompressed(std::string inFile) {
 
-	if (userInput.filter != "none" && getFileExt(userInput.file('r', 0)) == "rd")
-		filterRecords();
+	// All results generated while reading this file remain local until the final protected merge.
+	std::vector<std::pair<std::string, std::string>> md5sTmp;
 
-	// open and get file size
-	std::ifstream ifs(inFile, std::ios::binary | std::ios::ate);
+	std::ifstream ifs(inFile, std::ios::binary | std::ios::ate); // Open file and get file size.
 	if (!ifs) {
 		throw std::runtime_error("Failed to open input file: " + inFile);
 	}
@@ -1601,9 +1640,12 @@ void InReads::readTableCompressed(std::string inFile) {
 	}
 	headerBytes += static_cast<std::streamsize>(sizeof(md5sN));
 
+	md5sTmp.reserve(static_cast<size_t>(md5sN));
+
 	for (uint32_t i = 0; i < md5sN; ++i) {
 		uint16_t stringSize = 0;
-		std::string filename, md5;
+		std::string filename;
+		std::string md5;
 
 		ifs.read(reinterpret_cast<char*>(&stringSize), sizeof(stringSize));
 		if (!ifs) {
@@ -1635,7 +1677,8 @@ void InReads::readTableCompressed(std::string inFile) {
 		}
 		headerBytes += static_cast<std::streamsize>(stringSize);
 
-		md5s.emplace_back(std::move(filename), std::move(md5));
+		// Local vector: safe because it belongs only to this invocation/thread.
+		md5sTmp.emplace_back(std::move(filename), std::move(md5));
 	}
 
 	// ---- read decompressed size from file format ----
@@ -1699,7 +1742,9 @@ void InReads::readTableCompressed(std::string inFile) {
 	);
 
 	if (zrc != Z_OK) {
-		throw std::runtime_error("uncompress() failed with code " + std::to_string(zrc) + " for: " + inFile);
+		throw std::runtime_error(
+			"uncompress() failed with code " + std::to_string(zrc) + " for: " + inFile
+		);
 	}
 	if (outSize != decompressedSize_z) {
 		throw std::runtime_error("uncompress() size mismatch for: " + inFile);
@@ -1715,7 +1760,7 @@ void InReads::readTableCompressed(std::string inFile) {
 		}
 	};
 
-	// ACGTN
+	// ---- local ACGTN counts ----
 	need(sizeof(uint64_t) * 5);
 	const uint64_t A = read_u64(ptr);
 	const uint64_t C = read_u64(ptr);
@@ -1723,19 +1768,15 @@ void InReads::readTableCompressed(std::string inFile) {
 	const uint64_t T = read_u64(ptr);
 	const uint64_t N = read_u64(ptr);
 
-	totA += A;
-	totC += C;
-	totG += G;
-	totT += T;
-	totN += N;
-
-	// counts
+	// ---- local record counts ----
 	need(sizeof(uint64_t) * 3);
 	const uint64_t len8  = read_u64(ptr);
 	const uint64_t len16 = read_u64(ptr);
 	const uint64_t len64 = read_u64(ptr);
 
-	// validate expected payload size exactly
+	const uint64_t readsTmp = len8 + len16 + len64;
+
+	// ---- validate expected payload size exactly ----
 	const uint64_t expectedPayloadSize =
 		uint64_t(sizeof(uint64_t) * (5 + 3)) +
 		len8  * uint64_t(sizeof(uint8_t)  + sizeof(uint32_t)) +
@@ -1748,7 +1789,7 @@ void InReads::readTableCompressed(std::string inFile) {
 		);
 	}
 
-	// tmp vectors
+	// ---- local length/quality records ----
 	LenVector<float> readLensTmp;
 	auto& readLensTmp8  = readLensTmp.getReadLens8();
 	auto& readLensTmp16 = readLensTmp.getReadLens16();
@@ -1764,38 +1805,54 @@ void InReads::readTableCompressed(std::string inFile) {
 	readLensTmp16.reserve(static_cast<size_t>(len16));
 	readLensTmp64.reserve(static_cast<size_t>(len64));
 
-	// entries: (u8 + f32 bits)
+	// Entries: (u8 + f32 bits)
 	for (uint64_t i = 0; i < len8; ++i) {
 		need(sizeof(uint8_t) + sizeof(uint32_t));
 		const uint8_t l = read_u8(ptr);
-		const float   w = read_f32_bits(ptr);
+		const float w = read_f32_bits(ptr);
 		readLensTmp8.emplace_back(l, w);
 	}
 
-	// entries: (u16 + f32 bits)
+	// Entries: (u16 + f32 bits)
 	for (uint64_t i = 0; i < len16; ++i) {
 		need(sizeof(uint16_t) + sizeof(uint32_t));
 		const uint16_t l = read_u16(ptr);
-		const float    w = read_f32_bits(ptr);
+		const float w = read_f32_bits(ptr);
 		readLensTmp16.emplace_back(l, w);
 	}
 
-	// entries: (u64 + f32 bits)
+	// Entries: (u64 + f32 bits)
 	for (uint64_t i = 0; i < len64; ++i) {
 		need(sizeof(uint64_t) + sizeof(uint32_t));
 		const uint64_t l = read_u64(ptr);
-		const float    w = read_f32_bits(ptr);
+		const float w = read_f32_bits(ptr);
 		readLensTmp64.emplace_back(l, w);
 	}
 
-	// enforce exact consumption
-	if (ptr != end) {
+	// ---- enforce exact consumption ----
+	if (ptr != end)
 		throw std::runtime_error("Extra bytes in decompressed payload in: " + inFile);
-	}
 
-	// merge
-	readLens.insert(readLensTmp);
-	totReads += len8 + len16 + len64;
+	// ---- single protected merge ----
+	{
+		std::lock_guard<std::mutex> lock(writerMutex);
+
+		md5s.insert(
+			md5s.end(),
+			std::make_move_iterator(md5sTmp.begin()),
+			std::make_move_iterator(md5sTmp.end())
+		);
+
+		readLens.insert(readLensTmp);
+
+		totA += A;
+		totC += C;
+		totG += G;
+		totT += T;
+		totN += N;
+
+		totReads += readsTmp;
+	}
 }
 
 
