@@ -28,6 +28,8 @@ EnzymeInfo get_enzyme(const std::string& name) {
 		return EnzymeInfo{"NlaIII", "CATG", 4};
 	else if (name == "DpnII")
 		return EnzymeInfo{"DpnII", "GATC", 0};
+	else if (name == "CADC")
+		return EnzymeInfo{"CAD-C", "AGTCGCCTACCTACGCGCGTAGGTAGGCGACT", 32};
 	else
 		throw std::runtime_error("Unsupported restriction enzyme: " + name);
 }
@@ -85,24 +87,46 @@ void digest_read(const InRead& read, const EnzymeInfo& enz, std::vector<std::str
 	}
 
 	std::vector<int> cut_positions = find_cut_positions(read, enz);
-	std::vector<int> boundaries;
-	boundaries.reserve(cut_positions.size() + 2);
 
-	boundaries.push_back(0);
-	for (int c : cut_positions) {
-		if (c > 0 && c < n)
-			boundaries.push_back(c);
-	}
-	boundaries.push_back(n);
+	if (enz.name == "CAD-C") {
+		std::vector<std::pair<int, int>> read_intervals;
+		int start_of_next_interval = 0;
 
-	for (std::size_t i = 0; i + 1 < boundaries.size(); ++i) {
-		int start = boundaries[i];
-		int end   = boundaries[i + 1];
-		if (end > start) {
+		for (int c : cut_positions) {
+			read_intervals.push_back(std::pair(start_of_next_interval, c));
+			start_of_next_interval = c + enz.cut_offset;
+		}
+
+		for (std::pair<int, int> interval : read_intervals) {
+			int start = interval.first;
+			int end = interval.second;
 			frag_seqs.push_back(seq.substr(start, end - start));
 			frag_quals.push_back(qual.substr(start, end - start));
-			if (frag_lengths)
+			if (frag_lengths) {
 				frag_lengths->push_back(end - start);
+			}
+		}
+
+	} else {
+		std::vector<int> boundaries;
+		boundaries.reserve(cut_positions.size() + 2);
+
+		boundaries.push_back(0);
+		for (int c : cut_positions) {
+			if (c > 0 && c < n)
+				boundaries.push_back(c);
+		}
+		boundaries.push_back(n);
+
+		for (std::size_t i = 0; i + 1 < boundaries.size(); ++i) {
+			int start = boundaries[i];
+			int end   = boundaries[i + 1];
+			if (end > start) {
+				frag_seqs.push_back(seq.substr(start, end - start));
+				frag_quals.push_back(qual.substr(start, end - start));
+				if (frag_lengths)
+					frag_lengths->push_back(end - start);
+			}
 		}
 	}
 }
