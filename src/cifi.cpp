@@ -97,7 +97,9 @@ void digest_read(const InRead& read, const EnzymeInfo& enz, std::vector<std::str
 			read_intervals.push_back(std::pair<int, int>(start_of_next_interval, c));
 			start_of_next_interval = c + enz.cut_offset;
 		}
-		read_intervals.push_back(std::pair<int, int>(start_of_next_interval, n));
+		if (n - start_of_next_interval > enz.cut_offset) {
+			read_intervals.push_back(std::pair<int, int>(start_of_next_interval, n));
+		}
 
 		for (std::pair<int, int> interval : read_intervals) {
 			int start = interval.first;
