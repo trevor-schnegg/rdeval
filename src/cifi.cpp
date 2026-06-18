@@ -90,12 +90,14 @@ void digest_read(const InRead& read, const EnzymeInfo& enz, std::vector<std::str
 
 	if (enz.name == "CAD-C") {
 		std::vector<std::pair<int, int>> read_intervals;
-		int start_of_next_interval = 0;
 
+		// find all inter-nucleosome sequences in the read (between adapters)
+		int start_of_next_interval = 0;
 		for (int c : cut_positions) {
 			read_intervals.push_back(std::pair<int, int>(start_of_next_interval, c));
 			start_of_next_interval = c + enz.cut_offset;
 		}
+		read_intervals.push_back(std::pair<int, int>(start_of_next_interval, n));
 
 		for (std::pair<int, int> interval : read_intervals) {
 			int start = interval.first;
